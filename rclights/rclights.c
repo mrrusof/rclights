@@ -1,80 +1,12 @@
+// ********************************************************************************
+// Documented in blog post
+// http://ruslanledesma.com/2025/01/26/raspberry-pico-as-rc-lights-controller.html
+// ********************************************************************************
+
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
-
-/*
-# Silvia S15
-
-- Physical lights:
-  - Front white: off/on/hi
-  - Front blue: always on
-  - Left blinkers: off/blink
-  - Right blinkers: off/blink
-  - Stop: off/on/hi
-  - Reverse: off/on
-
-- Light states
-  - off
-  - on
-  - hi
-  - blink
-
-- Light configurations
-  - Day-night
-    - Affected lights
-      - Front white
-      - Stop
-    - States
-      - off: all off
-      - night: all on
-    - State count: 2
-    - Bits: 1
-  - Hi Beams
-    - Affected lights
-      - Front white
-    - States
-      - don't care
-      - on
-    - State count: 2
-    - Bits: 1
-  - Blink
-    - Affected lights
-      - Left/right blinkers
-    - States
-      - off: all off
-      - left: left blinkers blink
-      - right: right blinkers blink
-      - hazard: all blink
-    - State count: 4
-    - Bits: 2
-  - Reverse/Brake
-    - Affected lights
-      - Reverse
-      - Brake
-    - States
-      - off: reverse is off and stop is don't care (do what day-night does).
-      - reverse: reverse is on
-      - break: stop is hi
-    - State count: 3
-    - Bits: 2
-
-- Master light configurations := Combination count of independent light configurations: 2^6 = 64
-  - Example
-    - Configuration in binary: 101110
-    - Bit positions:           543210
-    - Interpretation
-      - Positions 0 and 1: configuration reverse/break is in state break
-      - TODO
-
-- Conversion of input PWM to master light configuration
-  - Example
-    - Input PWM us hi count range: [500, 2500]
-    - Input PWM us hi count range size: 2000
-    - Bucket size of input PWM range for each master light configuration: 31.25
-    - Midpoint of each bucket: 15.625
-
- */
 
 // ********************************************************************************
 // Measuring of input PWM
@@ -95,6 +27,7 @@ const uint16_t INPUT_PWM_COUNTER_MAX = INPUT_PWM_COUNTER_UNITS_PER_SEC / INPUT_P
 #define INPUT_PWM_SMOOTH_SAMPLES 4
 
 uint init_pwm_measuring() {
+  // Sanity checks
   assert(clock_get_hz(clk_sys)            == SYS_CLK_FREQ);
   assert(pwm_gpio_to_channel(INPUT_PIN)   == PWM_CHAN_B);
   assert(pwm_gpio_to_slice_num(INPUT_PIN) == INPUT_SLICE);
@@ -118,6 +51,11 @@ float measure_input_pwm_hi_us() {
   return hi_us;
 }
 
+/* The following function returns the average of the last
+   INPUT_PWM_AVG_SAMPLES input values.  This is one way to workaround
+   noise in the input signal.  It trades off read cycles for a
+   sequence of values that is less bumpy but might be away from most
+   of the input values if peaks are too big. */
 float average_input_pwm_hi_us() {
   static uint8_t curr_sample = 0;
   static float samples[INPUT_PWM_AVG_SAMPLES + 1];
@@ -132,11 +70,19 @@ float average_input_pwm_hi_us() {
   return avg_hi_us;
 }
 
+/* The following function returns the last smooth value until enough
+   input PWM values are the same.  INPUT_PWM_SMOOT_SAMPLES defines
+   many is enough.  This is one way to workaround noise in the input
+   signal.  It trades off read cycles for a squence of values that
+   ignores peaks but might not follow the average of the input signal
+   if there is too much noise.  */
 float smooth_input_pwm_hi_us() {
   static float smooth_hi_us = 0;
   static uint8_t curr_sample = 0;
   static float samples[INPUT_PWM_SMOOTH_SAMPLES];
 
+  /* You might want to experiment reading values directly or reading
+     an averaged value on the next line. */
   float avg_hi_us = measure_input_pwm_hi_us(); // average_input_pwm_hi_us();
   samples[curr_sample] = avg_hi_us;
 
@@ -161,7 +107,8 @@ float smooth_input_pwm_hi_us() {
 
 
 // ********************************************************************************
-// Light controls
+// Data structure Led and corresponding operations that control leds
+// connected to GPIO pins.
 
 const uint16_t OUTPUT_PWM_MAX_LEVEL = 100;
 const uint16_t OUTPUT_PWM_ON_LEVEL = 20;
@@ -270,65 +217,71 @@ void blink_led(struct Led* led) {
 
   if (blink_on) {
     turn_led_on(led);
-    led->state = ON; // TODO: remove?
   } else if (led->state == ON && !blink_on) {
     turn_led_off(led);
   }
 }
 
 // ********************************************************************************
-// Conversion of input PWM to master light configuration
+// Conversion of input PWM to master light states
 
-const float INPUT_PWM_US_RANGE_MIN = 1019;
-const float INPUT_PWM_US_RANGE_MAX = 1971;
-const float INPUT_PWM_US_RANGE_SIZE = INPUT_PWM_US_RANGE_MAX - INPUT_PWM_US_RANGE_MIN;
-const float MASTER_LIGHT_CONFIGURATION_COUNT = 48;
-const float INPUT_PWM_US_BUCKET_SIZE = INPUT_PWM_US_RANGE_SIZE / (MASTER_LIGHT_CONFIGURATION_COUNT - 1);
+const float INPUT_PWM_US_RANGE_MIN = 1019; // You might need to adjust these to match the MIN microseconds duty cycle for your transmitter/receiver combination
+const float INPUT_PWM_US_RANGE_MAX = 1981; // Similar warning as that of INPUT_PWM_US_RANGE_MIN
+const float INPUT_PWM_US_RANGE_SIZE = INPUT_PWM_US_RANGE_MAX - INPUT_PWM_US_RANGE_MIN + 1;
+const float MASTER_LIGHT_STATE_COUNT = 48;
+const float INPUT_PWM_US_BUCKET_SIZE = INPUT_PWM_US_RANGE_SIZE / (MASTER_LIGHT_STATE_COUNT - 1);
 
-uint8_t input_pwm_hi_us_to_config_id(float hi_us) {
-  /* uint8_t config_id = 0; */
+uint8_t input_pwm_hi_us_to_master_state_id(float hi_us) {
+  /* ******************************************************************************** */
+  /* Iterative way for debugging purposes.*/
+  /* uint8_t state_id = 0; */
   /* float current_threshold = INPUT_PWM_US_RANGE_MIN + INPUT_PWM_US_BUCKET_SIZE / 2; */
 
   /* while(current_threshold < hi_us) { */
-  /*   config_id++; */
+  /*   state_id++; */
   /*   current_threshold += INPUT_PWM_US_BUCKET_SIZE; */
   /* } */
 
   /* printf("current_threshold = %f\n", current_threshold); */
 
-  /* return config_id; */
+  /* return state_id; */
+  /* ******************************************************************************** */
 
   return (hi_us - INPUT_PWM_US_RANGE_MIN + INPUT_PWM_US_BUCKET_SIZE / 2) / INPUT_PWM_US_BUCKET_SIZE;
 }
 
-uint8_t input_pwm_hi_us_to_master_lights_config(float hi_us) {
-  uint8_t config_id = input_pwm_hi_us_to_config_id(hi_us);
+uint8_t input_pwm_hi_us_to_master_lights_state(float hi_us) {
+  uint8_t state_id = input_pwm_hi_us_to_master_state_id(hi_us);
 
-  /* printf("config_id = %d\n", config_id); */
+  /* printf("state_id = %d\n", state_id); */
 
-  uint8_t config = (config_id % 3) + ((config_id / 3) << 2);
+  uint8_t state = (state_id % 3) + ((state_id / 3) << 2);
 
-  return config;
+  return state;
 }
 
 // ********************************************************************************
-// Application of master light configuration
+// Application of master light states to light sets.
+//
+// Light sets introduced in the blog post do not correspond to a
+// concrete data structure, rather they are modelled by the
+// application of their corresponding rules in this section.
 
-void apply_front_white_light_rules(uint8_t day_night_config, uint8_t hi_beams_config) {
-  if (hi_beams_config) {
+void apply_front_white_light_rules(uint8_t day_night_state, uint8_t hi_beams_state) {
+  if (hi_beams_state) {
     turn_led_hi(&FRONT_WHITE);
     return;
   }
 
-  if (day_night_config) {
+  if (day_night_state) {
     turn_led_on(&FRONT_WHITE);
   } else {
     turn_led_off(&FRONT_WHITE);
   }
 }
 
-void apply_blink_light_config(uint8_t config) {
-  switch(config) {
+void apply_blink_light_state(uint8_t state) {
+  switch(state) {
   case 0: // off
     turn_led_off(&LEFT_BLINKERS);
     turn_led_off(&RIGHT_BLINKERS);
@@ -347,45 +300,45 @@ void apply_blink_light_config(uint8_t config) {
   }
 }
 
-void apply_reverse_light_config(uint8_t config) {
-  if (config) {
+void apply_reverse_light_state(uint8_t state) {
+  if (state) {
     turn_led_on(&REVERSE);
   } else {
     turn_led_off(&REVERSE);
   }
 }
 
-void apply_stop_light_rules(uint8_t day_night_config, uint8_t brake_light_config) {
-  if (brake_light_config) {
+void apply_stop_light_rules(uint8_t day_night_state, uint8_t brake_light_state) {
+  if (brake_light_state) {
     turn_led_hi(&STOP);
     return;
   }
 
-  if (day_night_config) {
+  if (day_night_state) {
     turn_led_on(&STOP);
   } else {
     turn_led_off(&STOP);
   }
 }
 
-void apply_master_lights_config(uint8_t config) {
-  uint8_t brake_light_config = config & 1;
-  uint8_t reverse_light_config = (config >> 1) & 1;
-  uint8_t blink_light_config = (config >> 2) & 3;
-  uint8_t hi_beams_config = (config >> 4) & 1;
-  uint8_t day_night_config = (config >> 5) & 1;
+void apply_master_lights_state(uint8_t state) {
+  uint8_t brake_light_state = state & 1;
+  uint8_t reverse_light_state = (state >> 1) & 1;
+  uint8_t blink_light_state = (state >> 2) & 3;
+  uint8_t hi_beams_state = (state >> 4) & 1;
+  uint8_t day_night_state = (state >> 5) & 1;
 
-  apply_stop_light_rules(day_night_config, brake_light_config);
-  apply_reverse_light_config(reverse_light_config);
-  apply_blink_light_config(blink_light_config);
-  apply_front_white_light_rules(day_night_config, hi_beams_config);
+  apply_stop_light_rules(day_night_state, brake_light_state);
+  apply_reverse_light_state(reverse_light_state);
+  apply_blink_light_state(blink_light_state);
+  apply_front_white_light_rules(day_night_state, hi_beams_state);
 }
 
 // ********************************************************************************
 // Program entry point
 
 int main() {
-  stdio_init_all();
+  /* stdio_init_all(); */
 
   init_pwm_measuring();
   init_leds();
@@ -393,17 +346,17 @@ int main() {
   turn_led_on(&FRONT_BLUE);
 
   float input_pwm_hi_us = 0;
-  uint8_t master_lights_config = 0;
+  uint8_t master_lights_state = 0;
 
   while(true) {
     input_pwm_hi_us = smooth_input_pwm_hi_us();
 
     /* printf("input_pwm_hi_us = %f\n", input_pwm_hi_us); */
 
-    master_lights_config = input_pwm_hi_us_to_master_lights_config(input_pwm_hi_us);
+    master_lights_state = input_pwm_hi_us_to_master_lights_state(input_pwm_hi_us);
 
-    /* printf("master_lights_config = %b\n", master_lights_config); */
+    /* printf("master_lights_state = %b\n", master_lights_state); */
 
-    apply_master_lights_config(master_lights_config);
+    apply_master_lights_state(master_lights_state);
   }
 }
